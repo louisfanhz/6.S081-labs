@@ -20,6 +20,7 @@ static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
+extern pagetable_t kernel_pagetable;
 
 // initialize the proc table at boot time.
 void
@@ -29,17 +30,7 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
-      initlock(&p->lock, "proc");
-
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+    initlock(&p->lock, "proc");
   }
   kvminithart();
 }
@@ -71,6 +62,12 @@ myproc(void) {
   struct proc *p = c->proc;
   pop_off();
   return p;
+}
+
+// Return the current process' kernel pagetable
+pagetable_t
+proc_kpgtbl() {
+  return myproc()->kpgtbl;
 }
 
 int
@@ -121,6 +118,23 @@ found:
     return 0;
   }
 
+  /* setup per-process kernel page table */
+  p->kpgtbl = create_proc_kpgtbl();
+  if (p->kpgtbl == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  // Allocate a page for the process's kernel stack.
+  // Map it high in memory, followed by an invalid
+  // guard page.
+  char *pa = kalloc();
+  if(pa == 0) panic("kalloc");
+  uint64 va = KSTACK((int) (p-proc));
+  Mappages(p->kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+  /* end of per-process kernel pgtbl setup */
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -139,9 +153,21 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  /* free physical memory allocated for kstack */
+  if (p->kstack) {
+    pte_t *pte = walk(p->kpgtbl, p->kstack, 0);
+    if (pte == 0) panic("freeproc: walk");
+    kfree((void *)PTE2PA(*pte));
+  }
+  p->kstack = 0;
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  /* free per-process kernel pgtbl */
+  if (p->kpgtbl)
+    free_proc_kpgtbl(p->kpgtbl);
   p->pagetable = 0;
+  p->kpgtbl = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -221,6 +247,9 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  /* copy user pgtbl mappings to per-process kernel pgtbl */
+  u2kvmcopy(p->pagetable, p->kpgtbl, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -243,9 +272,14 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    /* size cannot grow larger than PLIC */
+    if (PGROUNDUP(sz+n) >= PLIC)
+      return -1;
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    /* copy user pgtbl mappings to per-process kernel pgtbl */
+    u2kvmcopy(p->pagetable, p->kpgtbl, sz-n, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
@@ -274,6 +308,8 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+  /* copy user pgtbl mappings to per-process kernel pgtbl */
+  u2kvmcopy(np->pagetable, np->kpgtbl, 0, np->sz);
 
   np->parent = p;
 
@@ -473,6 +509,11 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        /* load the process kpgtbl into the core's satp register */
+        w_satp(MAKE_SATP(p->kpgtbl));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -485,6 +526,9 @@ scheduler(void)
     }
 #if !defined (LAB_FS)
     if(found == 0) {
+      /* no process is running, use global kernel pgtbl */
+      w_satp(MAKE_SATP(kernel_pagetable));
+      sfence_vma();
       intr_on();
       asm volatile("wfi");
     }

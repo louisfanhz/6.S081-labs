@@ -5,6 +5,8 @@
 #include "spinlock.h"
 #include "proc.h"
 
+#define PLIC_ADDR 0xC000000 /* process cannot grow larger than this addr */
+
 //
 // This file contains copyin_new() and copyinstr_new(), the
 // replacements for copyin and coyinstr in vm.c.
@@ -56,3 +58,25 @@ copyinstr_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   }
   return -1;
 }
+
+void
+u2kvmcopy(pagetable_t upgtbl, pagetable_t kpgtbl, uint64 oldsz, uint64 newsz)
+{
+  pte_t *pte_from, *pte_to;
+  uint64 a, pa;
+  int flags;
+
+  if (newsz < oldsz) return;
+
+  oldsz = PGROUNDUP(oldsz);
+  for (a = oldsz; a < newsz; a += PGSIZE) {
+    if ((pte_from = walk(upgtbl, a, 0)) == 0)
+      panic("u2kvmcopy: upgtbl walk");
+    if ((pte_to = walk(kpgtbl, a, 1)) == 0)
+      panic("u2kvmcopy: kpgtbl walk");
+    pa = PTE2PA(*pte_from);
+    flags = (PTE_FLAGS(*pte_from) & (~PTE_U));
+    *pte_to = PA2PTE(pa) | flags;
+  }
+}
+
