@@ -88,6 +88,33 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
   return &pagetable[PX(0, va)];
 }
 
+int
+COW_handle(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 oldpa;
+  uint64 newpa;
+  uint flags;
+
+  va = PGROUNDDOWN(va);
+  if ((pte = walk(pagetable, va, 0)) == 0)
+    return -1;
+
+  if ((oldpa = PTE2PA(*pte)) == 0)
+    return -1;
+
+  flags = PTE_FLAGS(*pte);
+  if (flags & PTE_COW) {
+    if ((newpa = (uint64)kalloc()) == 0)
+      return -1;
+    memmove((char *)newpa, (char *)oldpa, PGSIZE);
+    kfree((void *)oldpa);
+    flags = (flags & ~PTE_COW) | PTE_W;
+    *pte = PA2PTE((uint64)newpa) | flags;
+  }
+  return 0;
+}
+
 // Look up a virtual address, return the physical address,
 // or 0 if not mapped.
 // Can only be used to look up user pages.
@@ -311,7 +338,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  //char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -320,11 +347,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    /* disable PTE_W bit and set PTE_COW bit */
+    if (flags & PTE_W) {
+      flags = (flags | PTE_COW) & (~PTE_W);
+      *pte = PA2PTE(pa) | flags;
+    }
+    /* COW fork(): don't allocate physical space for now */
+    //if((mem = kalloc()) == 0)
+    //  goto err;
+    //memmove(mem, (char*)pa, PGSIZE);
+
+    /* increment page reference count before mappages bcause
+       uvmunmap will decrease ref cnt if mapping is not successful */
+    addref((void *)pa);
+    if(mappages(new, i, PGSIZE, pa/*(uint64)mem*/, flags) != 0){
+      //kfree(mem);
       goto err;
     }
   }
@@ -358,6 +395,13 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+
+    /* uesr page might be a COW page */
+    if (va0 >= MAXVA)
+      return -1;
+    if (COW_handle(pagetable, va0) != 0)
+      return -1;
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
