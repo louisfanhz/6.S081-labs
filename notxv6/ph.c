@@ -16,6 +16,7 @@ struct entry {
 struct entry *table[NBUCKET];
 int keys[NKEYS];
 int nthread = 1;
+pthread_mutex_t lock[NBUCKET];
 
 double
 now()
@@ -26,13 +27,16 @@ now()
 }
 
 static void 
-insert(int key, int value, struct entry **p, struct entry *n)
+insert(int key, int value, struct entry **p, int i)
 {
   struct entry *e = malloc(sizeof(struct entry));
   e->key = key;
   e->value = value;
-  e->next = n;
+  /* use lock to protect shared variable */
+  pthread_mutex_lock(&lock[i]);
+  e->next = *p;
   *p = e;
+  pthread_mutex_unlock(&lock[i]);
 }
 
 static 
@@ -51,7 +55,7 @@ void put(int key, int value)
     e->value = value;
   } else {
     // the new is new.
-    insert(key, value, &table[i], table[i]);
+    insert(key, value, &table[i], i);
   }
 }
 
@@ -106,6 +110,9 @@ main(int argc, char *argv[])
   if (argc < 2) {
     fprintf(stderr, "Usage: %s nthreads\n", argv[0]);
     exit(-1);
+  }
+  for (int i = 0; i < NBUCKET; i++) {
+    pthread_mutex_init(&lock[i], NULL);
   }
   nthread = atoi(argv[1]);
   tha = malloc(sizeof(pthread_t) * nthread);
