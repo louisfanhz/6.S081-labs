@@ -322,6 +322,39 @@ sys_open(void)
     return -1;
   }
 
+  /* 
+   * start: handle symbolic link 
+   */
+  int cnt = 0;
+  int length;
+  char next[MAXPATH+1];
+
+  if (!(omode & O_NOFOLLOW)) {
+    for (; cnt < 10 && ip->type == T_SYMLINK; cnt++) {
+      readi(ip, 0, (uint64)&length, 0, 4);
+      readi(ip, 0, (uint64)next, 4, length);
+      next[length] = 0;
+      iunlockput(ip);
+      ip = namei(next);
+      if (ip == 0) {
+        /* dst is symlink or target does not exist */
+        end_op();
+        return -1;
+      }
+      ilock(ip);
+    }
+  }
+  
+  if (cnt >= 10) {
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  /* 
+   * end: handle symbolic link 
+   */
+
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
     if(f)
       fileclose(f);
@@ -484,3 +517,53 @@ sys_pipe(void)
   }
   return 0;
 }
+
+int
+len(char *array)
+{
+  int i = 0;
+  for (; i < MAXPATH && array[i] != 0; i++)
+    ;
+  return i;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *newip;
+
+  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+  
+  begin_op();
+  /* create new symlink file */
+  newip = create(path, T_SYMLINK, 0, 0);
+  if (newip == 0) {
+    end_op();
+    return -1;
+  }
+
+  /* write the target path length and path into new inode */
+  int length = len(target);
+  writei(newip, 0, (uint64)&length, 0, 4);
+  writei(newip, 0, (uint64)target, 4, length+1);
+  iunlockput(newip);
+
+  end_op();
+  return 0;
+
+  return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
